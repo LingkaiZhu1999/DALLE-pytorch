@@ -3,6 +3,7 @@ from pathlib import Path
 import time
 from glob import glob
 import os
+import random
 import shutil
 
 import torch
@@ -50,6 +51,18 @@ parser.add_argument('--image_text_folder', type=str, required=True,
 parser.add_argument('--wds', type = str, default='',
                     help = 'Comma separated list of WebDataset (1) image and (2) text column names. Must contain 2 values, e.g. img,cap.')
 
+parser.add_argument('--wds_dataset_size', type=int, default=None,
+                    help='Number of image-text pairs in a WebDataset epoch. Required for deterministic, synchronized distributed epochs.')
+
+parser.add_argument('--wds_num_workers', type=int, default=4,
+                    help='Number of WebDataset loader workers per training process.')
+
+parser.add_argument('--wds_shuffle_buffer', type=int, default=10000,
+                    help='Number of decoded samples in the WebDataset shuffle buffer. Set to 0 to disable sample shuffling.')
+
+parser.add_argument('--seed', type=int, default=0,
+                    help='Base random seed. Each distributed rank receives a distinct derived seed.')
+
 parser.add_argument('--truncate_captions', dest='truncate_captions', action='store_true',
                     help='Captions passed in which exceed the max token length will be truncated if this is set.')
 
@@ -81,6 +94,9 @@ parser.add_argument('--wandb_name', default='dalle_train_transformer',
 parser.add_argument('--wandb_entity', default=None,
                     help='(optional) Name of W&B team/entity to log to.')
 
+parser.add_argument('--wandb_mode', choices=('online', 'offline', 'disabled'), default='online',
+                    help='Weights & Biases mode. Use disabled for smoke tests and offline on compute nodes without network access.')
+
 parser.add_argument('--stable_softmax', dest='stable_softmax', action='store_true',
                     help='Prevent values from becoming too large during softmax. Helps with stability in fp16 and Mixture of Quantization training.')
 
@@ -99,6 +115,9 @@ train_group.add_argument('--keep_n_checkpoints', default = None, type = int, hel
 train_group.add_argument('--batch_size', default = 4, type = int, help = 'Batch size')
 
 train_group.add_argument('--ga_steps', default = 1, type = int, help = 'Number of steps to accumulate gradients across per each iteration. DeepSpeed only.')
+
+train_group.add_argument('--zero_stage', default=0, choices=(0, 1, 2, 3), type=int,
+                         help='DeepSpeed ZeRO optimization stage.')
 
 train_group.add_argument('--learning_rate', default = 3e-4, type = float, help = 'Learning rate')
 
@@ -208,7 +227,7 @@ if not ENABLE_WEBDATASET:
 else:
     # quit early if no tar files were found
     if Path(args.image_text_folder).is_dir():
-        DATASET = [str(p) for p in Path(args.image_text_folder).glob("**/*") if ".tar" in str(p).lower()] # .name
+        DATASET = sorted(str(p) for p in Path(args.image_text_folder).glob("**/*.tar"))
         assert len(DATASET) > 0, 'The directory ({}) does not contain any WebDataset/.tar files.'.format(args.image_text_folder)
         print('Found {} WebDataset .tar(.gz) file(s) under given path {}!'.format(len(DATASET), args.image_text_folder))
     elif ('http://' in args.image_text_folder.lower()) | ('https://' in args.image_text_folder.lower()):
@@ -227,6 +246,11 @@ else:
 
 distr_backend = distributed_utils.set_backend_from_args(args)
 distr_backend.initialize()
+
+rank = distr_backend.get_rank()
+world_size = distr_backend.get_world_size()
+random.seed(args.seed + rank)
+torch.manual_seed(args.seed + rank)
 
 using_deepspeed = \
     distributed_utils.using_backend(distributed_utils.DeepSpeedBackend)
@@ -362,7 +386,15 @@ def tokenize(s):
         truncate_text=args.truncate_captions).squeeze(0)
 
 if ENABLE_WEBDATASET:
-    DATASET_SIZE = int(1e9) # You need to set a nominal length for the Dataset in order to avoid warnings from DataLoader
+    if args.wds_dataset_size is None:
+        raise ValueError('--wds_dataset_size is required with --wds; use the number of successfully downloaded image-text pairs')
+    if args.wds_dataset_size < BATCH_SIZE:
+        raise ValueError('--wds_dataset_size must be at least one global batch')
+    if BATCH_SIZE % world_size != 0:
+        raise ValueError(f'global --batch_size ({BATCH_SIZE}) must be divisible by world size ({world_size})')
+
+    DATASET_SIZE = args.wds_dataset_size
+    local_batch_size = BATCH_SIZE // world_size
 
     myimg, mycap = WEBDATASET_IMAGE_TEXT_COLUMNS
     image_text_mapping = {
@@ -380,9 +412,27 @@ if ENABLE_WEBDATASET:
             return False
         return True
 
-    w_dataset = wds.WebDataset(DATASET, handler=wds.warn_and_continue)
+    # Assign disjoint shards to ranks. WebDataset will additionally split each
+    # rank's shard list among its DataLoader workers.
+    if isinstance(DATASET, list):
+        rank_dataset = DATASET[rank::world_size]
+        if not rank_dataset:
+            raise ValueError(f'not enough WebDataset shards ({len(DATASET)}) for {world_size} ranks')
+    else:
+        if world_size != 1:
+            raise ValueError('distributed WebDataset training requires a directory of local shards')
+        rank_dataset = DATASET
+
+    w_dataset = wds.WebDataset(
+        rank_dataset,
+        shardshuffle=1000,
+        handler=wds.warn_and_continue,
+    )
     filtered_dataset = w_dataset.select(filter_dataset)
-    ds = filtered_dataset.map_dict(**image_text_mapping).map_dict(**image_mapping).to_tuple(mycap, myimg).batched(BATCH_SIZE / distr_backend.get_world_size(), partial=True)
+    ds = filtered_dataset.map_dict(**image_text_mapping).map_dict(**image_mapping)
+    if args.wds_shuffle_buffer > 0:
+        ds = ds.shuffle(args.wds_shuffle_buffer)
+    ds = ds.to_tuple(mycap, myimg).batched(local_batch_size, partial=False).repeat()
 else:
     ds = TextImageDataset(
         args.image_text_folder,
@@ -414,8 +464,11 @@ if not is_shuffle:
 # WebLoader for WebDataset and DeepSpeed compatibility
 
 if ENABLE_WEBDATASET:
-    dl = wds.WebLoader(ds, batch_size=None, shuffle=False, num_workers=4) # optionally add num_workers=2 (n) argument
-    number_of_batches = DATASET_SIZE // (BATCH_SIZE * distr_backend.get_world_size())
+    dl = wds.WebLoader(ds, batch_size=None, shuffle=False, num_workers=args.wds_num_workers)
+    # --batch_size is global, while every rank yields local_batch_size items.
+    # Repeating the shard stream ensures all ranks take exactly the same number
+    # of optimizer steps even when shards contain slightly different counts.
+    number_of_batches = DATASET_SIZE // BATCH_SIZE
     dl = dl.slice(number_of_batches)
     dl.length = number_of_batches
 else:
@@ -471,6 +524,7 @@ if is_root:
     run = wandb.init(
         project=args.wandb_name,
         entity=args.wandb_entity,
+        mode=args.wandb_mode,
         resume=False,
         config=model_config,
     )
@@ -479,7 +533,8 @@ if is_root:
 
 distr_backend.check_batch_size(BATCH_SIZE)
 deepspeed_config = {
-    'train_batch_size': BATCH_SIZE,
+    'train_batch_size': BATCH_SIZE * args.ga_steps,
+    'train_micro_batch_size_per_gpu': BATCH_SIZE // distr_backend.get_world_size(),
     'gradient_accumulation_steps': args.ga_steps,
     'gradient_clipping': GRAD_CLIP_NORM,
     'fp16': {
@@ -488,6 +543,9 @@ deepspeed_config = {
     'amp': {
         'enabled': args.amp,
         'opt_level': 'O1',
+    },
+    'zero_optimization': {
+        'stage': args.zero_stage,
     },
     "flops_profiler": {
         "enabled": args.flops_profiler,

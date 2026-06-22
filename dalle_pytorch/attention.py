@@ -43,7 +43,6 @@ class Attention(nn.Module):
         inner_dim = dim_head *  heads
         self.heads = heads
         self.seq_len = seq_len
-        self.scale = dim_head ** -0.5
 
         self.stable = stable
         self.causal = causal
@@ -57,7 +56,6 @@ class Attention(nn.Module):
 
     def forward(self, x, mask = None, rotary_pos_emb = None, cache = None, cache_key = None):
         b, n, _, h, device = *x.shape, self.heads, x.device
-        softmax = torch.softmax if not self.stable else stable_softmax
         offset = cache.get('offset', 0) if exists(cache) else 0
 
         qkv = self.to_qkv(x).chunk(3, dim = -1)
@@ -66,8 +64,6 @@ class Attention(nn.Module):
         if exists(rotary_pos_emb):
             q, k, v = apply_pos_emb(rotary_pos_emb[..., offset:, :], (q, k, v))
 
-        q = q * self.scale
-
         if offset > 0:
             k_top, v_top = cache[cache_key]
             k = torch.cat([k_top, k], dim=-2)
@@ -75,25 +71,34 @@ class Attention(nn.Module):
         if exists(cache):
             cache[cache_key] = k, v
 
-        dots = torch.einsum('b h i d, b h j d -> b h i j', q, k)
-        mask_value = max_neg_value(dots)
-
+        # A boolean SDPA mask uses True for positions that may participate in
+        # attention. Keep pure causal attention mask-free so PyTorch can select
+        # its fused FlashAttention kernel on supported CUDA devices.
+        attn_mask = None
         if exists(mask):
-            mask = rearrange(mask, 'b j -> b () () j')
-            dots.masked_fill_(~mask, mask_value)
-            del mask
-
-        if self.causal and offset == 0:  # causality is naturally enforced for the cached inference
-            i, j = dots.shape[-2:]
-            mask = torch.ones(i, j, device = device).triu_(j - i + 1).bool()
-            dots.masked_fill_(mask, mask_value)
+            attn_mask = rearrange(mask, 'b j -> b () () j')
 
         if exists(self.static_mask):
-            dots.masked_fill_(~self.static_mask[offset:offset + n, :offset + n], mask_value)
+            static_mask = self.static_mask[offset:offset + n, :k.shape[-2]]
+            static_mask = rearrange(static_mask, 'i j -> () () i j')
+            attn_mask = static_mask if attn_mask is None else (attn_mask & static_mask)
 
-        attn = softmax(dots, dim=-1)
+        is_causal = self.causal and offset == 0  # cached inference is causal by construction
+        if is_causal and attn_mask is not None:
+            i, j = q.shape[-2], k.shape[-2]
+            causal_mask = torch.ones(i, j, device=device, dtype=torch.bool).tril_(j - i)
+            attn_mask = attn_mask & causal_mask
+            is_causal = False
 
-        out = torch.einsum('b h i j, b h j d -> b h i d', attn, v)
+        # PyTorch applies the standard 1 / sqrt(head_dim) scale internally and
+        # dispatches to FlashAttention on supported CUDA devices.
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal,
+        )
+
         out = rearrange(out, 'b h n d -> b n (h d)')
         out =  self.to_out(out)
         return out
