@@ -167,6 +167,12 @@ def exists(val):
 def get_trainable_params(model):
     return [params for params in model.parameters() if params.requires_grad]
 
+def torch_load(path, **kwargs):
+    try:
+        return torch.load(path, weights_only=False, **kwargs)
+    except TypeError:
+        return torch.load(path, **kwargs)
+
 def cp_path_to_dir(cp_path, tag):
     """Convert a checkpoint path to a directory with `tag` inserted.
     If `cp_path` is already a directory, return it unchanged.
@@ -276,7 +282,7 @@ if RESUME:
         dalle_path = cp_dir / DEEPSPEED_CP_AUX_FILENAME
     else:
         assert dalle_path.exists(), 'DALL-E model file does not exist'
-    loaded_obj = torch.load(str(dalle_path), map_location='cpu')
+    loaded_obj = torch_load(str(dalle_path), map_location='cpu')
 
     dalle_params, vae_params, weights = loaded_obj['hparams'], loaded_obj['vae_params'], loaded_obj['weights']
     opt_state = loaded_obj.get('opt_state')
@@ -300,7 +306,7 @@ else:
              'Currently, merging a DeepSpeed-partitioned VAE into a DALLE '
              'model is not supported.')
 
-        loaded_obj = torch.load(str(vae_path))
+        loaded_obj = torch_load(str(vae_path), map_location='cpu')
 
         vae_params, weights = loaded_obj['hparams'], loaded_obj['weights']
 

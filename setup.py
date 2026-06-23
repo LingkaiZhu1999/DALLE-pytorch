@@ -27,20 +27,39 @@ setup(
     'pillow',
     'regex',
     'rotary-embedding-torch',
-    'taming-transformers-rom1504',
     'tokenizers',
     'torch>=2.0',
     'torchvision',
-    'transformers',
     'tqdm',
-    'youtokentome',
     'WebDataset'
   ],
+  extras_require={
+    'chinese': [
+      'transformers',
+      'huggingface-hub>=0.34,<1.0',
+    ],
+    'vqgan': [
+      'taming-transformers-rom1504',
+    ],
+    'yttm': [
+      'youtokentome',
+    ],
+    'all': [
+      'transformers',
+      'huggingface-hub>=0.34,<1.0',
+      'taming-transformers-rom1504',
+      'youtokentome',
+    ],
+  },
+  python_requires='>=3.9',
   classifiers=[
     'Development Status :: 4 - Beta',
     'Intended Audience :: Developers',
     'Topic :: Scientific/Engineering :: Artificial Intelligence',
-    'License :: OSI Approved :: MIT License',
-    'Programming Language :: Python :: 3.6',
+    'Programming Language :: Python :: 3',
+    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: 3.11',
+    'Programming Language :: Python :: 3.12',
   ],
 )

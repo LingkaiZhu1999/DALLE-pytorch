@@ -10,10 +10,10 @@ import yaml
 from pathlib import Path
 from tqdm import tqdm
 from math import sqrt, log
-from packaging import version
+from importlib.metadata import version as package_version
+from packaging.version import parse as parse_version
 
 from omegaconf import OmegaConf
-from taming.models.vqgan import VQModel, GumbelVQ
 import importlib
 
 import torch
@@ -23,6 +23,14 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from dalle_pytorch import distributed_utils
+
+try:
+    from taming.models.vqgan import VQModel, GumbelVQ
+except Exception as err:
+    VQModel = GumbelVQ = None
+    TAMING_IMPORT_ERROR = err
+else:
+    TAMING_IMPORT_ERROR = None
 
 # constants
 
@@ -44,7 +52,16 @@ def default(val, d):
 
 def load_model(path):
     with open(path, 'rb') as f:
-        return torch.load(f, map_location = torch.device('cpu'))
+        try:
+            return torch.load(f, map_location = torch.device('cpu'), weights_only = False)
+        except TypeError:
+            return torch.load(f, map_location = torch.device('cpu'))
+
+def load_checkpoint(path, **kwargs):
+    try:
+        return torch.load(path, weights_only = False, **kwargs)
+    except TypeError:
+        return torch.load(path, **kwargs)
 
 def map_pixels(x, eps = 0.1):
     return (1 - 2 * eps) * x + eps
@@ -100,18 +117,17 @@ def make_contiguous(module):
         for param in module.parameters():
             param.set_(param.contiguous())
 
-# package versions
-
-def get_pkg_version(pkg_name):
-    from pkg_resources import get_distribution
-    return get_distribution(pkg_name).version
-
 # pretrained Discrete VAE from OpenAI
 
 class OpenAIDiscreteVAE(nn.Module):
     def __init__(self):
         super().__init__()
-        assert version.parse(get_pkg_version('torch')) < version.parse('1.11.0'), 'torch version must be <= 1.10 in order to use OpenAI discrete vae'
+        if parse_version(package_version('torch')) >= parse_version('1.11.0'):
+            warnings.warn(
+                'OpenAI discrete VAE was originally released for torch <= 1.10; '
+                'attempting to load it with modern torch.',
+                RuntimeWarning
+            )
 
         self.enc = load_model(download(OPENAI_VAE_ENCODER_PATH))
         self.dec = load_model(download(OPENAI_VAE_DECODER_PATH))
@@ -160,6 +176,10 @@ def instantiate_from_config(config):
 class VQGanVAE(nn.Module):
     def __init__(self, vqgan_model_path=None, vqgan_config_path=None):
         super().__init__()
+        if TAMING_IMPORT_ERROR is not None:
+            raise ImportError(
+                'VQGanVAE requires a compatible taming-transformers installation.'
+            ) from TAMING_IMPORT_ERROR
 
         if vqgan_model_path is None:
             model_filename = 'vqgan.1024.model.ckpt'
@@ -176,7 +196,7 @@ class VQGanVAE(nn.Module):
 
         model = instantiate_from_config(config["model"])
 
-        state = torch.load(model_path, map_location = 'cpu')['state_dict']
+        state = load_checkpoint(model_path, map_location = 'cpu')['state_dict']
         model.load_state_dict(state, strict = False)
 
         print(f"Loaded VQGAN from {model_path} and {config_path}")

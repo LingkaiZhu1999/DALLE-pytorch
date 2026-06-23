@@ -3,11 +3,6 @@
 
 import torch
 
-import youtokentome as yttm
-from tokenizers import Tokenizer
-from tokenizers.processors import ByteLevel
-from transformers import BertTokenizer
-
 import html
 import os
 from functools import lru_cache
@@ -157,6 +152,9 @@ tokenizer = SimpleTokenizer()
 
 class HugTokenizer:
     def __init__(self, bpe_path = None):
+        from tokenizers import Tokenizer
+        from tokenizers.processors import ByteLevel
+
         bpe_path = Path(bpe_path)
         assert bpe_path.exists(), f'BPE json path {str(bpe_path)} does not exist'
         tokenizer = Tokenizer.from_file(str(bpe_path))
@@ -195,7 +193,12 @@ class HugTokenizer:
 
 class ChineseTokenizer:
     def __init__(self):
-        tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as err:
+            raise ImportError('ChineseTokenizer requires transformers.') from err
+
+        tokenizer = AutoTokenizer.from_pretrained('bert-base-chinese', use_fast=True)
         self.tokenizer = tokenizer
         self.vocab_size = tokenizer.vocab_size
 
@@ -231,11 +234,17 @@ class ChineseTokenizer:
 
 class YttmTokenizer:
     def __init__(self, bpe_path = None):
+        try:
+            import youtokentome as yttm
+        except ImportError as err:
+            raise ImportError('YttmTokenizer requires youtokentome.') from err
+
         bpe_path = Path(bpe_path)
         assert bpe_path.exists(), f'BPE json path {str(bpe_path)} does not exist'
 
         tokenizer = yttm.BPE(model = str(bpe_path))
         self.tokenizer = tokenizer
+        self.yttm = yttm
         self.vocab_size = tokenizer.vocab_size()
 
     def decode(self, tokens, pad_tokens = set()):
@@ -245,7 +254,7 @@ class YttmTokenizer:
         return self.tokenizer.decode(tokens, ignore_ids = pad_tokens.union({0}))
 
     def encode(self, texts):
-        encoded = self.tokenizer.encode(texts, output_type = yttm.OutputType.ID)
+        encoded = self.tokenizer.encode(texts, output_type = self.yttm.OutputType.ID)
         return list(map(torch.tensor, encoded))
 
     def tokenize(self, texts, context_length = 256, truncate_text = False):
